@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,7 +32,7 @@ const (
 	defaultGitlabDomain = "gitlab.com"
 )
 
-var loop, report bool
+var loop, report, applyTopicsOnly bool
 var deleteExistingRepos, enablePullRequests, renameMasterToMain, skipInvalidMergeRequests, trimGithubBranches bool
 var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath, renameTrunkBranch string
 var mergeRequestsAge int
@@ -93,6 +96,7 @@ func main() {
 
 	flag.BoolVar(&loop, "loop", false, "continue migrating until canceled")
 	flag.BoolVar(&report, "report", false, "report on primitives to be migrated instead of beginning migration")
+	flag.BoolVar(&applyTopicsOnly, "apply-topics-only", false, "when true, only applies topics to existing GitHub repositories from CSV, skips all migration")
 
 	flag.BoolVar(&deleteExistingRepos, "delete-existing-repos", false, "whether existing repositories should be deleted before migrating")
 	flag.BoolVar(&enablePullRequests, "migrate-pull-requests", false, "whether pull requests should be migrated")
@@ -181,7 +185,33 @@ func main() {
 		}
 
 		defer func() {
-			logger.Trace("waiting before retrying failed API request", "method", requestMethod, "url", requestUrl, "status", resp.StatusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
+			// Extract rate limit information from headers
+			rateLimitInfo := map[string]string{}
+			if v, ok := resp.Header["X-Ratelimit-Limit"]; ok {
+				rateLimitInfo["limit"] = v[0]
+			}
+			if v, ok := resp.Header["X-Ratelimit-Remaining"]; ok {
+				rateLimitInfo["remaining"] = v[0]
+			}
+			if v, ok := resp.Header["X-Ratelimit-Reset"]; ok {
+				if resetEpoch, err := strconv.ParseInt(v[0], 10, 64); err == nil {
+					resetTime := time.Unix(resetEpoch, 0)
+					rateLimitInfo["resets_at"] = resetTime.Format(time.RFC3339)
+					rateLimitInfo["resets_in"] = time.Until(resetTime).Round(time.Second).String()
+				}
+			}
+			if v, ok := resp.Header["X-Ratelimit-Resource"]; ok {
+				rateLimitInfo["resource"] = v[0]
+			}
+
+			logger.Trace("waiting before retrying failed API request",
+				"method", requestMethod,
+				"url", requestUrl,
+				"status", resp.StatusCode,
+				"sleep", sleep,
+				"attempt", attemptNum,
+				"max_attempts", retryClient.RetryMax,
+				"rate_limit", rateLimitInfo)
 		}()
 
 		if resp != nil {
@@ -280,7 +310,31 @@ func main() {
 
 		for _, status := range retryableStatuses {
 			if resp.StatusCode == status {
-				logger.Trace("retrying failed API request", "method", requestMethod, "url", requestUrl, "status", resp.StatusCode, "message", errResp.Message)
+				// Extract rate limit information from headers
+				rateLimitInfo := map[string]string{}
+				if v, ok := resp.Header["X-Ratelimit-Limit"]; ok {
+					rateLimitInfo["limit"] = v[0]
+				}
+				if v, ok := resp.Header["X-Ratelimit-Remaining"]; ok {
+					rateLimitInfo["remaining"] = v[0]
+				}
+				if v, ok := resp.Header["X-Ratelimit-Reset"]; ok {
+					if resetEpoch, err := strconv.ParseInt(v[0], 10, 64); err == nil {
+						resetTime := time.Unix(resetEpoch, 0)
+						rateLimitInfo["resets_at"] = resetTime.Format(time.RFC3339)
+						rateLimitInfo["resets_in"] = time.Until(resetTime).Round(time.Second).String()
+					}
+				}
+				if v, ok := resp.Header["X-Ratelimit-Resource"]; ok {
+					rateLimitInfo["resource"] = v[0]
+				}
+
+				logger.Trace("retrying failed API request",
+					"method", requestMethod,
+					"url", requestUrl,
+					"status", resp.StatusCode,
+					"message", errResp.Message,
+					"rate_limit", rateLimitInfo)
 				return true, nil
 			}
 		}
@@ -288,8 +342,12 @@ func main() {
 		return false, nil
 	}
 
+	// Wrap with rate limiter to proactively stay under GitHub's API limits
+	rateLimitedTransport := newRateLimitedTransport(&retryablehttp.RoundTripper{Client: retryClient})
+	logger.Info("rate limiting enabled", "core_api", "0.33 req/sec (~20 req/min)", "search_api", "0.1 req/sec (~6 req/min)", "write_api", "0.033 req/sec (~1 per 30sec - prevents secondary limits)")
+
 	transport := &gitHubAdvancedSearchModder{
-		base: &retryablehttp.RoundTripper{Client: retryClient},
+		base: rateLimitedTransport,
 	}
 	client := githubpagination.NewClient(transport, githubpagination.WithPerPage(100))
 
@@ -324,9 +382,15 @@ func main() {
 		// Trim a UTF-8 BOM, if present
 		data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 
-		if projects, err = csv.NewReader(bytes.NewBuffer(data)).ReadAll(); err != nil {
+		allRows, err := csv.NewReader(bytes.NewBuffer(data)).ReadAll()
+		if err != nil {
 			sendErr(err)
 			os.Exit(1)
+		}
+
+		// Skip header row (first row)
+		if len(allRows) > 0 {
+			projects = allRows[1:]
 		}
 	} else {
 		projects = []Project{{gitlabProject, githubRepo}}
@@ -334,6 +398,14 @@ func main() {
 
 	if report {
 		printReport(ctx, projects)
+	} else if applyTopicsOnly {
+		if err = applyTopicsFromCsv(ctx, projects); err != nil {
+			sendErr(err)
+			os.Exit(1)
+		} else if errCount > 0 {
+			logger.Warn(fmt.Sprintf("encountered %d errors applying topics, review log output for details", errCount))
+			os.Exit(1)
+		}
 	} else {
 		if err = performMigration(ctx, projects); err != nil {
 			sendErr(err)
@@ -500,6 +572,104 @@ func performMigration(ctx context.Context, projects []Project) error {
 	}
 
 	wg.Wait()
+
+	return nil
+}
+
+func applyTopicsFromCsv(ctx context.Context, projects []Project) error {
+	logger.Info(fmt.Sprintf("applying topics to %d project(s)", len(projects)))
+
+	var successCount, failureCount int
+	totalCount := len(projects)
+
+	for _, slugs := range projects {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if len(slugs) < 2 {
+			logger.Warn("skipping row with insufficient fields", "fields", len(slugs))
+			failureCount++
+			continue
+		}
+
+		// Parse github_path: "org/repo"
+		githubPathParts := strings.Split(slugs[1], "/")
+		if len(githubPathParts) != 2 {
+			logger.Warn("invalid github path", "path", slugs[1])
+			failureCount++
+			continue
+		}
+
+		githubOrg := githubPathParts[0]
+		githubRepo := githubPathParts[1]
+
+		// Parse topics (pipe-separated)
+		topics := parseProjectTopics(slugs)
+
+		if len(topics) == 0 {
+			logger.Info("no topics to apply", "owner", githubOrg, "repo", githubRepo)
+			successCount++
+			continue
+		}
+
+		logger.Info("applying topics", "owner", githubOrg, "repo", githubRepo, "topics", topics)
+
+		// Create minimal project-like structure for topic application
+		topicsPayload := map[string]interface{}{
+			"names": topics,
+		}
+
+		payloadBytes, err := json.Marshal(topicsPayload)
+		if err != nil {
+			logger.Error("marshaling topics payload", "owner", githubOrg, "repo", githubRepo, "error", err)
+			failureCount++
+			continue
+		}
+
+		topicsUrl := fmt.Sprintf("https://api.%s/repos/%s/%s/topics", githubDomain, githubOrg, githubRepo)
+		if githubDomain != "github.com" {
+			topicsUrl = fmt.Sprintf("https://%s/api/v3/repos/%s/%s/topics", githubDomain, githubOrg, githubRepo)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, topicsUrl, bytes.NewBuffer(payloadBytes))
+		if err != nil {
+			logger.Error("creating topics request", "owner", githubOrg, "repo", githubRepo, "error", err)
+			failureCount++
+			continue
+		}
+
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", githubToken))
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			logger.Error("applying topics", "owner", githubOrg, "repo", githubRepo, "error", err)
+			failureCount++
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			logger.Warn("failed to apply topics", "owner", githubOrg, "repo", githubRepo, "status", resp.StatusCode, "response", string(body))
+			failureCount++
+			continue
+		}
+
+		logger.Info("topics applied successfully", "owner", githubOrg, "repo", githubRepo, "topics", topics)
+		successCount++
+	}
+
+	skippedCount := totalCount - successCount - failureCount
+
+	logger.Info("topics application complete", "total", totalCount, "successful", successCount, "failed", failureCount, "skipped", skippedCount)
+
+	if failureCount > 0 {
+		errCount += failureCount
+	}
 
 	return nil
 }

@@ -132,8 +132,8 @@ func pointer[T any](v T) *T {
 }
 
 func parseProjectSlugs(slugs []string) ([]string, []string, error) {
-	if len(slugs) != 2 {
-		return nil, nil, fmt.Errorf("too many fields")
+	if len(slugs) < 2 || len(slugs) > 3 {
+		return nil, nil, fmt.Errorf("expected 2 or 3 fields, got %d", len(slugs))
 	}
 
 	delimPosition := strings.LastIndex(slugs[0], "/")
@@ -151,6 +151,27 @@ func parseProjectSlugs(slugs []string) ([]string, []string, error) {
 	}
 
 	return gitlabPath, githubPath, nil
+}
+
+func parseProjectTopics(slugs []string) []string {
+	if len(slugs) < 3 {
+		return []string{}
+	}
+
+	topicsStr := strings.TrimSpace(slugs[2])
+	if topicsStr == "" {
+		return []string{}
+	}
+
+	var topics []string
+	for _, topic := range strings.Split(topicsStr, "|") {
+		topic = strings.TrimSpace(topic)
+		if topic != "" {
+			topics = append(topics, topic)
+		}
+	}
+
+	return topics
 }
 
 func roundDuration(d, r time.Duration) time.Duration {

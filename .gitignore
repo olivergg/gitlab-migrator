@@ -1,3 +1,4 @@
 dist/
 gitlab-migrator
 *.csv
+.claude
