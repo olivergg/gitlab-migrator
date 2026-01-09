@@ -181,7 +181,33 @@ func main() {
 		}
 
 		defer func() {
-			logger.Trace("waiting before retrying failed API request", "method", requestMethod, "url", requestUrl, "status", resp.StatusCode, "sleep", sleep, "attempt", attemptNum, "max_attempts", retryClient.RetryMax)
+			// Extract rate limit information from headers
+			rateLimitInfo := map[string]string{}
+			if v, ok := resp.Header["X-Ratelimit-Limit"]; ok {
+				rateLimitInfo["limit"] = v[0]
+			}
+			if v, ok := resp.Header["X-Ratelimit-Remaining"]; ok {
+				rateLimitInfo["remaining"] = v[0]
+			}
+			if v, ok := resp.Header["X-Ratelimit-Reset"]; ok {
+				if resetEpoch, err := strconv.ParseInt(v[0], 10, 64); err == nil {
+					resetTime := time.Unix(resetEpoch, 0)
+					rateLimitInfo["resets_at"] = resetTime.Format(time.RFC3339)
+					rateLimitInfo["resets_in"] = time.Until(resetTime).Round(time.Second).String()
+				}
+			}
+			if v, ok := resp.Header["X-Ratelimit-Resource"]; ok {
+				rateLimitInfo["resource"] = v[0]
+			}
+
+			logger.Trace("waiting before retrying failed API request",
+				"method", requestMethod,
+				"url", requestUrl,
+				"status", resp.StatusCode,
+				"sleep", sleep,
+				"attempt", attemptNum,
+				"max_attempts", retryClient.RetryMax,
+				"rate_limit", rateLimitInfo)
 		}()
 
 		if resp != nil {
@@ -280,7 +306,31 @@ func main() {
 
 		for _, status := range retryableStatuses {
 			if resp.StatusCode == status {
-				logger.Trace("retrying failed API request", "method", requestMethod, "url", requestUrl, "status", resp.StatusCode, "message", errResp.Message)
+				// Extract rate limit information from headers
+				rateLimitInfo := map[string]string{}
+				if v, ok := resp.Header["X-Ratelimit-Limit"]; ok {
+					rateLimitInfo["limit"] = v[0]
+				}
+				if v, ok := resp.Header["X-Ratelimit-Remaining"]; ok {
+					rateLimitInfo["remaining"] = v[0]
+				}
+				if v, ok := resp.Header["X-Ratelimit-Reset"]; ok {
+					if resetEpoch, err := strconv.ParseInt(v[0], 10, 64); err == nil {
+						resetTime := time.Unix(resetEpoch, 0)
+						rateLimitInfo["resets_at"] = resetTime.Format(time.RFC3339)
+						rateLimitInfo["resets_in"] = time.Until(resetTime).Round(time.Second).String()
+					}
+				}
+				if v, ok := resp.Header["X-Ratelimit-Resource"]; ok {
+					rateLimitInfo["resource"] = v[0]
+				}
+
+				logger.Trace("retrying failed API request",
+					"method", requestMethod,
+					"url", requestUrl,
+					"status", resp.StatusCode,
+					"message", errResp.Message,
+					"rate_limit", rateLimitInfo)
 				return true, nil
 			}
 		}
@@ -288,8 +338,12 @@ func main() {
 		return false, nil
 	}
 
+	// Wrap with rate limiter to proactively stay under GitHub's API limits
+	rateLimitedTransport := newRateLimitedTransport(&retryablehttp.RoundTripper{Client: retryClient})
+	logger.Info("rate limiting enabled", "core_api", "0.33 req/sec (~20 req/min)", "search_api", "0.1 req/sec (~6 req/min)", "write_api", "0.033 req/sec (~1 per 30sec - prevents secondary limits)")
+
 	transport := &gitHubAdvancedSearchModder{
-		base: &retryablehttp.RoundTripper{Client: retryClient},
+		base: rateLimitedTransport,
 	}
 	client := githubpagination.NewClient(transport, githubpagination.WithPerPage(100))
 

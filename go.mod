@@ -1,6 +1,6 @@
 module github.com/manicminer/gitlab-migrator
 
-go 1.23.2
+go 1.24.0
 
 require (
 	github.com/go-git/go-billy/v5 v5.6.2
@@ -36,6 +36,6 @@ require (
 	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/oauth2 v0.26.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
-	golang.org/x/time v0.10.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 )

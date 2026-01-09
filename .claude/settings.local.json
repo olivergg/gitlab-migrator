@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(go get:*)",
+      "Bash(./oceangitlab.sh:*)",
+      "Bash(tee:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}
